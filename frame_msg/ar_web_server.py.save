@@ -1,0 +1,297 @@
+import asyncio
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
+import io
+import numpy as np
+import pytesseract
+import pyttsx3  
+from frame_msg import FrameMsg, RxPhoto, TxCaptureSettings, TxSprite, TxImageSpriteBlock
+from aiohttp import web
+import json
+
+pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
+
+frame_connection = None
+
+def read_aloud(text: str):
+    if not text.strip():
+        return
+    engine = pyttsx3.init()
+    engine.say(text)
+    engine.runAndWait()
+
+async def capture_image(num_photos=1, resolution=1080):
+    frame = FrameMsg()
+    try:
+        await frame.connect()
+        await frame.print_short_text('Capturing...')
+        await frame.upload_stdlua_libs(lib_names=['data', 'camera', 'image_sprite_block'])
+        await frame.upload_frame_app(local_filename="lua/camera_image_sprite_block_frame_app.lua")
+        await frame.start_frame_app()
+
+        rx_photo = RxPhoto()
+        photo_queue = await rx_photo.attach(frame)
+        capture_msg_bytes = TxCaptureSettings(resolution=resolution, quality_index=0, pan=-40).pack()
+
+        images_for_ocr = []
+
+        for _ in range(num_photos):
+            await frame.send_message(0x0d, capture_msg_bytes)
+            jpeg_bytes = await asyncio.wait_for(photo_queue.get(), timeout=10.0)
+            image = Image.open(io.BytesIO(jpeg_bytes))
+            
+            ocr_image = image.convert('L')
+            ocr_image = ocr_image.resize((3200, 3200), Image.LANCZOS)
+            ocr_image = ocr_image.filter(ImageFilter.MedianFilter(size=3))
+            
+            np_img = np.array(ocr_image)
+            mean_brightness = np_img.mean()
+            
+            if mean_brightness < 100:
+                contrast_factor = 2.5
+                brightness_factor = 1.3
+            elif mean_brightness > 180:
+                contrast_factor = 1.8
+                brightness_factor = 0.9
+            else:
+                contrast_factor = 2.0
+                brightness_factor = 1.1
+            
+            ocr_image = ImageEnhance.Contrast(ocr_image).enhance(contrast_factor)
+            ocr_image = ImageEnhance.Brightness(ocr_image).enhance(brightness_factor)
+            ocr_image = ImageEnhance.Sharpness(ocr_image).enhance(1.8)
+            ocr_image = ocr_image.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+            
+            images_for_ocr.append(ocr_image)
+
+        rx_photo.detach(frame)
+        return images_for_ocr
+
+    except Exception as e:
+        print(f"Capture error: {e}")
+        return None
+    finally:
+        await frame.stop_frame_app()
+        await frame.disconnect()
+
+def extract_text(image):
+    psm_modes = [
+        ('--oem 3 --psm 3', 'Automatic page segmentation'),
+        ('--oem 3 --psm 6', 'Uniform text block'),
+        ('--oem 1 --psm 3', 'LSTM with auto segmentation'),
+        ('--oem 3 --psm 4', 'Single column of text'),
+    ]
+    
+    results = []
+    
+    for config, description in psm_modes:
+        try:
+            text = pytesseract.image_to_string(image, config=config).strip()
+            if text:
+                results.append((len(text), text, description))
+                print(f"  {description}: {len(text)} chars")
+        except Exception as e:
+            print(f"  {description} failed: {e}")
+            continue
+    
+    if not results:
+        print("No text detected with any method")
+        return ""
+    
+    results.sort(reverse=True, key=lambda x: x[0])
+    best_length, best_text, best_method = results[0]
+    
+    print(f"✓ Best result: {best_method} with {best_length} characters")
+    
+    best_text = best_text.replace('|', 'I')
+    best_text = best_text.replace('`', "'")
+    
+    lines = best_text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        cleaned = ' '.join(line.split())
+        if cleaned:
+            cleaned_lines.append(cleaned)
+    
+    return '\n'.join(cleaned_lines)
+
+def wrap_text_to_lines(text, font, max_width=240):
+    lines = []
+    paragraphs = text.split('\n')
+    
+    for paragraph in paragraphs:
+        if not paragraph.strip():
+            lines.append('')
+            continue
+            
+        words = paragraph.split()
+        line = ""
+        for word in words:
+            test_line = line + (" " if line else "") + word
+            w = font.getbbox(test_line)[2]
+            if w > max_width:
+                if line:
+                    lines.append(line)
+                line = word
+            else:
+                line = test_line
+        if line:
+            lines.append(line)
+    
+    return lines
+
+async def display_text_with_settings(frame, text, settings):
+    if not text.strip():
+        print("No text to display")
+        return
+
+    font_name = settings.get('font', 'Comic Sans MS Bold.ttf')
+    font_size = settings.get('fontSize', 64)
+    line_spacing = settings.get('lineSpacing', 2)
+    scroll_speed = settings.get('scrollSpeed', 2.0)
+    text_color = settings.get('textColor', '#ffffff')
+    bg_color = settings.get('bgColor', '#000000')
+    
+    text_rgb = tuple(int(text_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+    bg_rgb = tuple(int(bg_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+    
+    try:
+        font = ImageFont.truetype(font_name, font_size)
+    except:
+        print(f"Font {font_name} not found, using default")
+        font = ImageFont.load_default()
+
+    all_lines = wrap_text_to_lines(text, font, max_width=240)
+    
+    print(f"Total lines: {len(all_lines)}")
+    if not all_lines:
+        return
+    
+    line_height = font.getbbox("Test")[3] + line_spacing
+    max_lines_per_screen = max(1, 256 // line_height)
+    
+    print(f"Lines per screen: {max_lines_per_screen}")
+    
+    pages = []
+    for i in range(0, len(all_lines), max_lines_per_screen):
+        pages.append(all_lines[i:i + max_lines_per_screen])
+    
+    print(f"Total pages: {len(pages)}")
+    
+    for page_num, page_lines in enumerate(pages):
+        print(f"Displaying page {page_num + 1}/{len(pages)}")
+        
+        img = Image.new('RGB', (256, 256), color=bg_rgb)
+        draw = ImageDraw.Draw(img)
+        
+        y = 0
+        for line in page_lines:
+            if y + line_height <= 256:
+                draw.text((4, y), line, font=font, fill=text_rgb)
+                y += line_height
+        
+        img_gray = img.convert('L')
+        bw = img_gray.point(lambda x: 0 if x < 128 else 255, '1')
+        unpacked = np.unpackbits(np.frombuffer(bw.tobytes(), dtype=np.uint8))
+        
+        sprite = TxSprite(
+            width=256,
+            height=256,
+            num_colors=2,
+            palette_data=bytes([bg_rgb[0], bg_rgb[1], bg_rgb[2], text_rgb[0], text_rgb[1], text_rgb[2]]),
+            pixel_data=unpacked.tobytes()
+        )
+        isb = TxImageSpriteBlock(sprite, sprite_line_height=32)
+
+        await frame.send_message(0x20, isb.pack())
+        for line_sprite in isb.sprite_lines:
+            await frame.send_message(0x20, line_sprite.pack())
+            await asyncio.sleep(0.02)
+        
+        if page_num < len(pages) - 1:
+            await asyncio.sleep(scroll_speed)
+
+async def handle_display(request):
+    try:
+        data = await request.json()
+        text = data.get('text', '')
+        
+        if not text:
+            return web.json_response({'error': 'No text provided'}, status=400)
+        
+        frame = FrameMsg()
+        await frame.connect()
+        await frame.upload_stdlua_libs(lib_names=['data', 'image_sprite_block'])
+        await frame.upload_frame_app(local_filename="lua/camera_image_sprite_block_frame_app.lua")
+        await frame.start_frame_app()
+        
+        await display_text_with_settings(frame, text, data)
+        
+        if data.get('readAloud', False):
+            read_aloud(text)
+        
+        await frame.stop_frame_app()
+        await frame.disconnect()
+        
+        return web.json_response({'status': 'success'})
+        
+    except Exception as e:
+        print(f"Display error: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+async def handle_capture(request):
+    try:
+        images = await capture_image(num_photos=1)
+        
+        if not images:
+            return web.json_response({'error': 'Failed to capture image'}, status=500)
+        
+        text = extract_text(images[0])
+        
+        return web.json_response({
+            'text': text,
+            'length': len(text)
+        })
+        
+    except Exception as e:
+        print(f"Capture error: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+async def handle_index(request):
+    try:
+        with open('ar_control.html', 'r') as f:
+            html_content = f.read()
+    except FileNotFoundError:
+        html_content = "<h1>AR Glasses Control</h1><p>Please create ar_control.html file</p>"
+    return web.Response(text=html_content, content_type='text/html')
+
+async def main():
+    app = web.Application()
+    
+    async def cors_middleware(app, handler):
+        async def middleware_handler(request):
+            response = await handler(request)
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Methods'] = 'POST, GET, OPTIONS'
+            response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+            return response
+        return middleware_handler
+    
+    app.middlewares.append(cors_middleware)
+    
+    app.router.add_get('/', handle_index)
+    app.router.add_post('/display', handle_display)
+    app.router.add_post('/capture', handle_capture)
+    
+    print("🚀 AR Glasses Web Server starting on http://localhost:8000")
+    print("📱 Open your browser and go to http://localhost:8000")
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 8000)
+    await site.start()
+    
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
